@@ -8,6 +8,7 @@
 #include <imgui.h>
 #include <imgui_impl_win32.h>
 #include <imgui_impl_dx12.h>
+#include "ui/UiRenderer.h"
 
 
 // Debug
@@ -70,7 +71,7 @@ static UINT g_ResizeWidth = 0, g_ResizeHeight = 0;
 
 static bool g_present1Hooked = false;
 
-bool show_demo_window = true;
+static bool g_show_ui = true;
 bool bShould_render = true;
 
 static void CreateRenderTarget()
@@ -159,6 +160,9 @@ void InitImGui()
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;  // prevent system cursor flicker on exit
     ImGui::StyleColorsLight();
+
+    // Initialize UI (loads ReShade-like default font) BEFORE backend init so atlas is uploaded once
+    ui::Initialize();
 
     ImGui_ImplWin32_Init(window);
 
@@ -402,19 +406,21 @@ HRESULT __fastcall hkPresent(IDXGISwapChain3 *pSwapChain, UINT SyncInterval, UIN
         CreateRenderTarget();
     }
 
-    // Обработка переключения окна
+    // Toggle UI visibility with Insert
     if (GetAsyncKeyState(VK_INSERT) & 1)
-        show_demo_window = !show_demo_window;
+        g_show_ui = !g_show_ui;
 
     // Начало нового кадра
     ImGui_ImplDX12_NewFrame();
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
 
-    // Отрисовка ImGui
-    ImGui::GetIO().MouseDrawCursor = show_demo_window;
-    if (show_demo_window)
-        ImGui::ShowDemoWindow();
+    // UI draw
+    if (g_show_ui)
+    {
+        ui::Draw();
+    }
+    ImGui::GetIO().MouseDrawCursor = g_show_ui;
 
     // Получаем текущий back buffer
     UINT backBufferIdx = g_pSwapChain->GetCurrentBackBufferIndex();
@@ -648,8 +654,11 @@ HRESULT __fastcall hkPresent1(IDXGISwapChain1 *pSwapChain, UINT SyncInterval, UI
         ImGui_ImplDX12_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
-        ImGui::GetIO().MouseDrawCursor = show_demo_window;
-        if (show_demo_window) ImGui::ShowDemoWindow();
+        if (g_show_ui)
+        {
+            ui::Draw();
+        }
+        ImGui::GetIO().MouseDrawCursor = g_show_ui;
         ImGui::Render();
         ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), g_pd3dCommandList);
 

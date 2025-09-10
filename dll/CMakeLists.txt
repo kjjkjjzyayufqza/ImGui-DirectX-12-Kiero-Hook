@@ -38,6 +38,7 @@ add_library(${DLL_NAME} SHARED
     ${CMAKE_SOURCE_DIR}/vendor/kiero/kiero.cpp
     src/hooks/d3d12hook.cpp
     src/dev/Console.cpp
+    src/ui/UiRenderer.cpp
 )
 
 set_output_directories(${DLL_NAME})
@@ -50,6 +51,9 @@ target_link_libraries(${DLL_NAME} PRIVATE
     d3d12.lib
     dxgi.lib
 )
+
+# Note: std::filesystem is available in C++17/C++20 standard library
+# No additional linking required for modern compilers
 
 target_include_directories(${DLL_NAME} PRIVATE 
     ${imgui_SOURCE_DIR}
