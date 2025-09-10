@@ -3,6 +3,8 @@
 #include <kiero.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
+#include <dxgi1_2.h>
+#include <MinHook.h>
 #include <imgui.h>
 #include <imgui_impl_win32.h>
 #include <imgui_impl_dx12.h>
@@ -14,6 +16,12 @@
 
 typedef HRESULT(__stdcall *PresentFunc)(IDXGISwapChain *pSwapChain, UINT SyncInterval, UINT Flags);
 PresentFunc oPresent = nullptr;
+
+typedef HRESULT(__stdcall *Present1Func)(IDXGISwapChain1 *pSwapChain, UINT SyncInterval, UINT PresentFlags, const DXGI_PRESENT_PARAMETERS* pPresentParameters);
+Present1Func oPresent1 = nullptr;
+
+// Forward declaration for IDXGISwapChain1::Present1 hook
+HRESULT __fastcall hkPresent1(IDXGISwapChain1 *pSwapChain, UINT SyncInterval, UINT PresentFlags, const DXGI_PRESENT_PARAMETERS* pPresentParameters);
 
 typedef void(__stdcall *ExecuteCommandListsFunc)(ID3D12CommandQueue *pCommandQueue, UINT NumCommandLists, ID3D12CommandList *const *ppCommandLists);
 ExecuteCommandListsFunc oExecuteCommandLists = nullptr;
@@ -60,10 +68,12 @@ static HANDLE g_hSwapChainWaitableObject = nullptr;
 // static D3D12_CPU_DESCRIPTOR_HANDLE  g_mainRenderTargetDescriptor[NUM_BACK_BUFFERS] = {}; // Original
 static UINT g_ResizeWidth = 0, g_ResizeHeight = 0;
 
+static bool g_present1Hooked = false;
+
 bool show_demo_window = true;
 bool bShould_render = true;
 
-void CreateRenderTarget()
+static void CreateRenderTarget()
 {
     if (!g_pSwapChain || !g_pd3dDevice || !g_pd3dRtvDescHeap || !g_frameContext || NUM_BACK_BUFFERS <= 0)
         return;
@@ -100,7 +110,7 @@ void CreateRenderTarget()
     }
 }
 
-void CleanupRenderTarget()
+static void CleanupRenderTarget()
 {
     if (g_frameContext && NUM_BACK_BUFFERS > 0)
     {
@@ -115,9 +125,10 @@ void CleanupRenderTarget()
     }
 }
 
-void WaitForLastSubmittedFrame()
+static void WaitForLastSubmittedFrame()
 {
-    FrameContext *frameCtx = &g_frameContext[g_frameIndex % NUM_FRAMES_IN_FLIGHT];
+    UINT bufferCount = (NUM_BACK_BUFFERS > 0) ? (UINT)NUM_BACK_BUFFERS : NUM_FRAMES_IN_FLIGHT;
+    FrameContext *frameCtx = &g_frameContext[g_frameIndex % bufferCount];
 
     UINT64 fenceValue = frameCtx->FenceValue;
     if (fenceValue == 0)
@@ -158,6 +169,144 @@ void InitImGui()
                         g_pd3dSrvDescHeap->GetGPUDescriptorHandleForHeapStart());
 }
 
+static bool IsDirectQueue(ID3D12CommandQueue* queue)
+{
+    if (!queue) return false;
+    D3D12_COMMAND_QUEUE_DESC desc = queue->GetDesc();
+    return desc.Type == D3D12_COMMAND_LIST_TYPE_DIRECT;
+}
+
+static void SignalFrameFence(FrameContext& frameCtx)
+{
+    if (!g_pd3dCommandQueue || !g_fence)
+        return;
+    ++g_fenceLastSignaledValue;
+    frameCtx.FenceValue = g_fenceLastSignaledValue;
+    g_pd3dCommandQueue->Signal(g_fence, g_fenceLastSignaledValue);
+}
+
+static void CreateFrameContextsAndAllocators(UINT bufferCount)
+{
+    if (g_frameContext)
+    {
+        for (UINT i = 0; i < NUM_FRAMES_IN_FLIGHT; ++i)
+        {
+            // Free previous resources if any
+            if (g_frameContext[i].g_mainRenderTargetResource)
+            {
+                g_frameContext[i].g_mainRenderTargetResource->Release();
+                g_frameContext[i].g_mainRenderTargetResource = nullptr;
+            }
+            if (g_frameContext[i].CommandAllocator)
+            {
+                g_frameContext[i].CommandAllocator->Release();
+                g_frameContext[i].CommandAllocator = nullptr;
+            }
+        }
+        delete[] g_frameContext;
+        g_frameContext = nullptr;
+    }
+
+    NUM_BACK_BUFFERS = static_cast<int>(bufferCount);
+    g_frameContext = new FrameContext[NUM_BACK_BUFFERS];
+    for (UINT i = 0; i < bufferCount; ++i)
+    {
+        g_frameContext[i].FenceValue = 0;
+        g_frameContext[i].g_mainRenderTargetResource = nullptr;
+        g_frameContext[i].g_mainRenderTargetDescriptor = {};
+        g_pd3dDevice->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_frameContext[i].CommandAllocator));
+    }
+}
+
+static bool HookPresent1IfAvailable()
+{
+    if (g_present1Hooked)
+        return true;
+
+    // Create a temporary device/queue/swapchain1 to obtain Present1 address
+    WNDCLASSEX wc { sizeof(WNDCLASSEX) };
+    wc.style = CS_HREDRAW | CS_VREDRAW;
+    wc.lpfnWndProc = DefWindowProc;
+    wc.hInstance = GetModuleHandle(NULL);
+    wc.lpszClassName = L"Kiero_Present1_Window";
+    RegisterClassEx(&wc);
+    HWND tempWnd = CreateWindow(wc.lpszClassName, L"Kiero_Present1", WS_OVERLAPPEDWINDOW, 0, 0, 100, 100, NULL, NULL, wc.hInstance, NULL);
+
+    IDXGIFactory2* factory = nullptr;
+    if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory))))
+    {
+        DestroyWindow(tempWnd);
+        UnregisterClass(wc.lpszClassName, wc.hInstance);
+        return false;
+    }
+
+    ID3D12Device* device = nullptr;
+    if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device))))
+    {
+        factory->Release();
+        DestroyWindow(tempWnd);
+        UnregisterClass(wc.lpszClassName, wc.hInstance);
+        return false;
+    }
+
+    D3D12_COMMAND_QUEUE_DESC qd = {};
+    qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    ID3D12CommandQueue* cq = nullptr;
+    if (FAILED(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&cq))))
+    {
+        device->Release();
+        factory->Release();
+        DestroyWindow(tempWnd);
+        UnregisterClass(wc.lpszClassName, wc.hInstance);
+        return false;
+    }
+
+    DXGI_SWAP_CHAIN_DESC1 scd = {};
+    scd.Width = 100;
+    scd.Height = 100;
+    scd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    scd.BufferCount = 2;
+    scd.SampleDesc.Count = 1;
+    scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+
+    IDXGISwapChain1* sc1 = nullptr;
+    if (FAILED(factory->CreateSwapChainForHwnd(cq, tempWnd, &scd, nullptr, nullptr, &sc1)))
+    {
+        cq->Release();
+        device->Release();
+        factory->Release();
+        DestroyWindow(tempWnd);
+        UnregisterClass(wc.lpszClassName, wc.hInstance);
+        return false;
+    }
+
+    void** vtbl = *(void***)sc1;
+    // IDXGISwapChain base has 18 entries; Present1 is the 5th new method in IDXGISwapChain1 (index 22 overall)
+    const int kPresent1Index = 22;
+    void* present1Addr = vtbl[kPresent1Index];
+
+    bool hooked = false;
+    if (present1Addr)
+    {
+        if (MH_CreateHook(present1Addr, (LPVOID)&hkPresent1, reinterpret_cast<void**>(&oPresent1)) == MH_OK &&
+            MH_EnableHook(present1Addr) == MH_OK)
+        {
+            g_present1Hooked = true;
+            hooked = true;
+        }
+    }
+
+    sc1->Release();
+    cq->Release();
+    device->Release();
+    factory->Release();
+    DestroyWindow(tempWnd);
+    UnregisterClass(wc.lpszClassName, wc.hInstance);
+
+    return hooked;
+}
+
 HRESULT __fastcall hkPresent(IDXGISwapChain3 *pSwapChain, UINT SyncInterval, UINT Flags)
 {
     static bool init = false;
@@ -196,44 +345,25 @@ HRESULT __fastcall hkPresent(IDXGISwapChain3 *pSwapChain, UINT SyncInterval, UIN
                     return oPresent(pSwapChain, SyncInterval, Flags);
             }
 
-            // Command Allocator
-            ID3D12CommandAllocator *allocator;
-            if (FAILED(g_pd3dDevice->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))))
-                return oPresent(pSwapChain, SyncInterval, Flags);
+            // Command Allocators (one per back buffer)
+            CreateFrameContextsAndAllocators(sdesc.BufferCount);
 
-            // Command List
-            if (FAILED(g_pd3dDevice->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, nullptr, IID_PPV_ARGS(&g_pd3dCommandList))))
+            // Command List (independent, will reset per-frame with its allocator)
+            if (FAILED(g_pd3dDevice->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_frameContext[0].CommandAllocator, nullptr, IID_PPV_ARGS(&g_pd3dCommandList))))
             {
-                allocator->Release();
                 return oPresent(pSwapChain, SyncInterval, Flags);
             }
             g_pd3dCommandList->Close();
 
-            // Frame Contexts
-            g_frameContext = new FrameContext[NUM_BACK_BUFFERS];
-            if (!g_frameContext)
-            {
-                allocator->Release();
-                return oPresent(pSwapChain, SyncInterval, Flags);
-            }
-
-            for (UINT i = 0; i < NUM_BACK_BUFFERS; i++)
-            {
-                g_frameContext[i].CommandAllocator = allocator;
-                g_frameContext[i].FenceValue = 0;
-            }
-
             // Fence & Events
             if (FAILED(g_pd3dDevice->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_fence))))
             {
-                allocator->Release();
                 return oPresent(pSwapChain, SyncInterval, Flags);
             }
 
             g_fenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
             if (g_fenceEvent == nullptr)
             {
-                allocator->Release();
                 return oPresent(pSwapChain, SyncInterval, Flags);
             }
 
@@ -250,6 +380,9 @@ HRESULT __fastcall hkPresent(IDXGISwapChain3 *pSwapChain, UINT SyncInterval, UIN
             InitImGui();
 
             init = true;
+
+            // Attempt to hook Present1 for games that use it instead of Present
+            HookPresent1IfAvailable();
         }
         return oPresent(pSwapChain, SyncInterval, Flags);
     }
@@ -261,6 +394,7 @@ HRESULT __fastcall hkPresent(IDXGISwapChain3 *pSwapChain, UINT SyncInterval, UIN
     // Обработка изменения размера
     if (g_ResizeWidth != 0 && g_ResizeHeight != 0)
     {
+        g_frameIndex = g_pSwapChain->GetCurrentBackBufferIndex();
         WaitForLastSubmittedFrame();
         CleanupRenderTarget();
         g_pSwapChain->ResizeBuffers(0, g_ResizeWidth, g_ResizeHeight, DXGI_FORMAT_UNKNOWN, 0);
@@ -284,6 +418,7 @@ HRESULT __fastcall hkPresent(IDXGISwapChain3 *pSwapChain, UINT SyncInterval, UIN
 
     // Получаем текущий back buffer
     UINT backBufferIdx = g_pSwapChain->GetCurrentBackBufferIndex();
+    g_frameIndex = backBufferIdx;
     FrameContext &frameCtx = g_frameContext[backBufferIdx];
 
     // Сброс command allocator
@@ -316,13 +451,14 @@ HRESULT __fastcall hkPresent(IDXGISwapChain3 *pSwapChain, UINT SyncInterval, UIN
 
     // Выполнение command list
     g_pd3dCommandQueue->ExecuteCommandLists(1, reinterpret_cast<ID3D12CommandList *const *>(&g_pd3dCommandList));
+    SignalFrameFence(frameCtx);
 
     return oPresent(pSwapChain, SyncInterval, Flags);
 }
 
 void __fastcall hkExecuteCommandLists(ID3D12CommandQueue *pCommandQueue, UINT NumCommandLists, ID3D12CommandList *const *ppCommandLists)
 {
-    if (!g_pd3dCommandQueue)
+    if (!g_pd3dCommandQueue && IsDirectQueue(pCommandQueue))
     {
         g_pd3dCommandQueue = pCommandQueue;
     }
@@ -332,24 +468,37 @@ void __fastcall hkExecuteCommandLists(ID3D12CommandQueue *pCommandQueue, UINT Nu
 
 HRESULT __fastcall hkResizeBuffers(IDXGISwapChain3 *pSwapChain, UINT BufferCount, UINT Width, UINT Height, DXGI_FORMAT NewFormat, UINT SwapChainFlags)
 {
-    // Проверяем готовность к изменению размера
+    // Если DirectX объекты еще не инициализированы, просто передаем вызов дальше
     if (!g_pd3dDevice || !g_pSwapChain)
     {
-        LOG_ERROR("Cannot resize - DirectX objects not initialized");
+        LOG_INFO("ResizeBuffers called before DirectX initialization - passing through");
         return oResizeBuffers(pSwapChain, BufferCount, Width, Height, NewFormat, SwapChainFlags);
     }
+
+    // Проверяем, что SwapChain соответствует нашему
+    if (pSwapChain != g_pSwapChain)
+    {
+        LOG_INFO("ResizeBuffers called on different SwapChain - passing through");
+        return oResizeBuffers(pSwapChain, BufferCount, Width, Height, NewFormat, SwapChainFlags);
+    }
+
+    LOG_INFO("Handling ResizeBuffers: %dx%d, BufferCount: %d", Width, Height, BufferCount);
 
     if (g_pd3dDevice)
     {
         ImGui_ImplDX12_InvalidateDeviceObjects();
     }
 
+    // Ensure GPU finished with current resources for this frame
+    g_frameIndex = g_pSwapChain->GetCurrentBackBufferIndex();
+    WaitForLastSubmittedFrame();
+
     CleanupRenderTarget();
 
-    // Сохраняем новое количество буферов
-    NUM_BACK_BUFFERS = BufferCount;
+    // Recreate frame contexts and allocators according to new buffer count
+    CreateFrameContextsAndAllocators(BufferCount);
 
-    // Вызываем оригинальную функцию
+    // Call original function
     HRESULT result = oResizeBuffers(pSwapChain, BufferCount, Width, Height, NewFormat, SwapChainFlags);
 
     if (SUCCEEDED(result))
@@ -360,6 +509,7 @@ HRESULT __fastcall hkResizeBuffers(IDXGISwapChain3 *pSwapChain, UINT BufferCount
         {
             ImGui_ImplDX12_CreateDeviceObjects();
         }
+        LOG_INFO("ResizeBuffers completed successfully");
     }
     else
     {
@@ -367,6 +517,154 @@ HRESULT __fastcall hkResizeBuffers(IDXGISwapChain3 *pSwapChain, UINT BufferCount
     }
 
     return result;
+}
+
+// Hook for IDXGISwapChain1::Present1, mirrors hkPresent logic but preserves Present1 semantics
+HRESULT __fastcall hkPresent1(IDXGISwapChain1 *pSwapChain, UINT SyncInterval, UINT PresentFlags, const DXGI_PRESENT_PARAMETERS* pPresentParameters)
+{
+    static bool init1 = false;
+
+    IDXGISwapChain3* sc3 = nullptr;
+    if (SUCCEEDED(pSwapChain->QueryInterface(IID_PPV_ARGS(&sc3))) && sc3)
+    {
+        if (!init1)
+        {
+            if (!g_pd3dCommandQueue)
+            {
+                sc3->Release();
+                return oPresent1(pSwapChain, SyncInterval, PresentFlags, pPresentParameters);
+            }
+
+            if (SUCCEEDED(sc3->GetDevice(__uuidof(ID3D12Device), (void **)&g_pd3dDevice)))
+            {
+                DXGI_SWAP_CHAIN_DESC sdesc;
+                sc3->GetDesc(&sdesc);
+                window = sdesc.OutputWindow;
+                NUM_BACK_BUFFERS = sdesc.BufferCount;
+
+                // SRV Heap
+                {
+                    D3D12_DESCRIPTOR_HEAP_DESC desc = {};
+                    desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+                    desc.NumDescriptors = 1;
+                    desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+                    if (FAILED(g_pd3dDevice->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&g_pd3dSrvDescHeap))))
+                    {
+                        sc3->Release();
+                        return oPresent1(pSwapChain, SyncInterval, PresentFlags, pPresentParameters);
+                    }
+                }
+
+                // RTV Heap
+                {
+                    D3D12_DESCRIPTOR_HEAP_DESC desc = {};
+                    desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+                    desc.NumDescriptors = NUM_BACK_BUFFERS;
+                    desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+                    desc.NodeMask = 1;
+                    if (FAILED(g_pd3dDevice->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&g_pd3dRtvDescHeap))))
+                    {
+                        sc3->Release();
+                        return oPresent1(pSwapChain, SyncInterval, PresentFlags, pPresentParameters);
+                    }
+                }
+
+                // Command Allocators (one per back buffer)
+                CreateFrameContextsAndAllocators(sdesc.BufferCount);
+
+                // Command List
+                if (FAILED(g_pd3dDevice->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_frameContext[0].CommandAllocator, nullptr, IID_PPV_ARGS(&g_pd3dCommandList))))
+                {
+                    sc3->Release();
+                    return oPresent1(pSwapChain, SyncInterval, PresentFlags, pPresentParameters);
+                }
+                g_pd3dCommandList->Close();
+
+                // Fence & Events
+                if (FAILED(g_pd3dDevice->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_fence))))
+                {
+                    sc3->Release();
+                    return oPresent1(pSwapChain, SyncInterval, PresentFlags, pPresentParameters);
+                }
+
+                g_fenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+                if (g_fenceEvent == nullptr)
+                {
+                    sc3->Release();
+                    return oPresent1(pSwapChain, SyncInterval, PresentFlags, pPresentParameters);
+                }
+
+                g_hSwapChainWaitableObject = sc3->GetFrameLatencyWaitableObject();
+                g_pSwapChain = sc3;
+
+                // Create RenderTarget
+                CreateRenderTarget();
+
+                // Hook window procedure
+                oWndProc = (WNDPROC)SetWindowLongPtr(window, GWLP_WNDPROC, (__int3264)(LONG_PTR)WndProc);
+
+                // Initialize ImGui last
+                InitImGui();
+
+                init1 = true;
+            }
+        }
+
+        if (!g_pd3dCommandQueue || !g_pd3dDevice || !g_frameContext || !g_pd3dSrvDescHeap)
+        {
+            sc3->Release();
+            return oPresent1(pSwapChain, SyncInterval, PresentFlags, pPresentParameters);
+        }
+
+        // Resize handling
+        if (g_ResizeWidth != 0 && g_ResizeHeight != 0)
+        {
+            g_frameIndex = g_pSwapChain->GetCurrentBackBufferIndex();
+            WaitForLastSubmittedFrame();
+            CleanupRenderTarget();
+            g_pSwapChain->ResizeBuffers(0, g_ResizeWidth, g_ResizeHeight, DXGI_FORMAT_UNKNOWN, 0);
+            g_ResizeWidth = g_ResizeHeight = 0;
+            CreateRenderTarget();
+        }
+
+        UINT backBufferIdx = g_pSwapChain->GetCurrentBackBufferIndex();
+        g_frameIndex = backBufferIdx;
+        FrameContext &frameCtx = g_frameContext[backBufferIdx];
+        frameCtx.CommandAllocator->Reset();
+
+        D3D12_RESOURCE_BARRIER barrier = {};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+        barrier.Transition.pResource = g_frameContext[backBufferIdx].g_mainRenderTargetResource;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+
+        g_pd3dCommandList->Reset(frameCtx.CommandAllocator, nullptr);
+        g_pd3dCommandList->ResourceBarrier(1, &barrier);
+        g_pd3dCommandList->OMSetRenderTargets(1, &g_frameContext[backBufferIdx].g_mainRenderTargetDescriptor, FALSE, nullptr);
+        g_pd3dCommandList->SetDescriptorHeaps(1, &g_pd3dSrvDescHeap);
+
+        ImGui_ImplDX12_NewFrame();
+        ImGui_ImplWin32_NewFrame();
+        ImGui::NewFrame();
+        ImGui::GetIO().MouseDrawCursor = show_demo_window;
+        if (show_demo_window) ImGui::ShowDemoWindow();
+        ImGui::Render();
+        ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), g_pd3dCommandList);
+
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+        g_pd3dCommandList->ResourceBarrier(1, &barrier);
+        g_pd3dCommandList->Close();
+
+        g_pd3dCommandQueue->ExecuteCommandLists(1, reinterpret_cast<ID3D12CommandList *const *>(&g_pd3dCommandList));
+        SignalFrameFence(frameCtx);
+
+        sc3->Release();
+    }
+
+    return oPresent1(pSwapChain, SyncInterval, PresentFlags, pPresentParameters);
 }
 
 HRESULT __fastcall hkSignal(ID3D12CommandQueue *queue, ID3D12Fence *fence, UINT64 value)
